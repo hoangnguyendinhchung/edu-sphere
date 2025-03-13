@@ -1,0 +1,452 @@
+import Nat "mo:base/Nat";
+import Nat32 "mo:base/Nat32";
+import Bool "mo:base/Bool";
+import Text "mo:base/Text";
+import Array "mo:base/Array";
+import Buffer "mo:base/Buffer";
+import Time "mo:base/Time";
+import Iter "mo:base/Iter";
+import Result "mo:base/Result";
+import Internal "mo:⛔";
+import Principal "mo:base/Principal";
+
+import HashMap "libs/FunctionalStableHashMap";
+import Dao "Dao"; 
+import Types "./types/Types";
+import { tutoIdHash; tutoIdEqual } = "./types/Types";
+
+shared ({ caller = deployer }) actor class EduSphere() = {
+
+  public type Tutorial = Types.Tutorial;
+  public type Publication = Types.Publication;
+  public type Comment = Types.Comment;
+  public type User = Types.User;
+  public type SignUpResult = Result.Result<User, Types.SignUpErrors>;
+  public type PublishResult = Result.Result<Publication, Text>;
+  public type TutoId = Nat;
+  public type UserId = Nat;
+  public type UserSettings = Types.UserSettings;
+  public type DaoFounder = Types.DaoFounder;
+
+  stable var admins : [Principal] = [deployer];
+
+  stable let userIds = HashMap.init<Principal, UserId>();
+  stable let users = HashMap.init<UserId, User>();
+  stable let blackList = HashMap.init<Principal, ()>();
+  stable let incomingPublications = HashMap.init<TutoId, Publication>();
+  stable let aprovedPublications = HashMap.init<TutoId, Publication>();
+
+  stable var counterGeneralId = 0;
+  stable var DAO = Principal.fromText("aaaaa-aa");
+
+  public shared ({ caller }) func deployDaoCanister(_name : Text, _manifesto : Text, founders : [DaoFounder], extraFees : Nat) : async Principal {
+    assert (isAdmin(caller));
+    assert (not _daoIsDeployed()); 
+    Internal.cyclesAdd<system>(13_846_199_230 + extraFees); 
+    let daoCanister = await Dao.Dao(_name, _manifesto, founders); 
+    DAO := Principal.fromActor(daoCanister);
+    return DAO
+  };
+
+  func _daoIsDeployed() : Bool {
+    Principal.fromText("aaaaa-aa") != DAO
+  };
+
+  func generateId() : Nat {
+    counterGeneralId += 1;
+    counterGeneralId - 1
+  };
+
+  func inBlackList(p : Principal) : Bool {
+    return switch (HashMap.get(blackList, Principal.equal, Principal.hash, p)) {
+      case null { false };
+      case _ { true }
+    }
+  };
+
+  func isAdmin(p : Principal) : Bool {
+    for (a in admins.vals()) {
+      if (a == p) { return true }
+    };
+    false
+  };
+
+  func isUser(p : Principal) : Bool {
+    return switch (HashMap.get(userIds, Principal.equal, Principal.hash, p)) {
+      case null { false };
+      case _ { true }
+    }
+  };
+
+  func getUserByPrincipal(p : Principal) : ?User {
+    switch (HashMap.get(userIds, Principal.equal, Principal.hash, p)) {
+      case null { null };
+      case (?userId) { HashMap.get(users, Nat.equal, Nat32.fromNat, userId) }
+    }
+  };
+  func getUserById(_id : Nat) : ?User {
+    HashMap.get(users, Nat.equal, Nat32.fromNat, _id)
+  };
+
+  func validateEjecution(_caller : Principal) : () {
+    if (_daoIsDeployed()) {
+      assert _caller == DAO
+    } else { (assert isAdmin(_caller)) }
+  };
+  public shared ({ caller }) func votePublication(_id : TutoId, _vote : Bool) : async Bool {
+    assert isUser(caller);
+    assert _daoIsDeployed();
+    let date = Time.now();
+    let daoActor = actor (Principal.toText(DAO)) : actor {
+      votePublication : shared (Principal, TutoId, Int, Bool) -> async Bool
+    };
+    return await daoActor.votePublication(caller, _id, date, _vote)
+  };
+
+
+  public shared ({ caller }) func aprovePublication(id : Nat) : async Result.Result<(), Text> {
+    validateEjecution(caller);
+
+    let pub = HashMap.remove(incomingPublications, tutoIdEqual, tutoIdHash, id);
+    switch (pub) {
+      case null { return #err("Tutorial id does not exist") };
+      case (?tuto) {
+        let autor = HashMap.get(users, Nat.equal, Nat32.fromNat, tuto.autor);
+        switch autor {
+          case null { return #err("Error inesperado :P") };
+          case (?autor) {
+            let updatPublications = Buffer.fromArray<TutoId>(autor.postPublicated);
+            updatPublications.add(id);
+            let postPublicated = Buffer.toArray<TutoId>(updatPublications);
+            let updateAutor = { autor with postPublicated };
+            HashMap.put<UserId, User>(users, Nat.equal, Nat32.fromNat, tuto.autor, updateAutor);
+            HashMap.put<TutoId, Publication>(aprovedPublications, tutoIdEqual, tutoIdHash, id, tuto );
+            return #ok()
+          }
+        };
+
+      }
+    }
+  };
+
+  public shared ({ caller }) func rejectPublication(id : Nat) : async Result.Result<(), Text> {
+    validateEjecution(caller);
+
+    let pub = HashMap.remove(incomingPublications, tutoIdEqual, tutoIdHash, id);
+    return switch (pub) {
+      case null { #err("Tutorial id does not exist") };
+      case (_) { #ok() }
+    }
+  };
+
+  public shared ({ caller }) func getIncomingPublication() : async [Publication] {
+    validateEjecution(caller);
+    return Iter.toArray(HashMap.vals(incomingPublications))
+  };
+
+  public shared ({ caller }) func addAdmin(p : Text) : async Bool {
+    assert (isAdmin(caller));
+    for (a in admins.vals()) { if (a == Principal.fromText(p)) { return true } };
+    var tempBuffer = Buffer.fromArray<Principal>(admins);
+    tempBuffer.add(Principal.fromText(p));
+
+    admins := Buffer.toArray<Principal>(tempBuffer);
+    true
+  };
+
+  public shared query ({ caller }) func whoAmi() : async Text {
+    "Soy " # Principal.toText(caller)
+  };
+
+  public shared ({ caller }) func signUp(name : Text, email : ?Text, avatar : ?Blob) : async SignUpResult {
+
+    if (Principal.isAnonymous(caller)) {
+      return #err(#CallerAnnonymous)
+    };
+    if (inBlackList(caller)) {
+      return #err(#InBlackList)
+    };
+    let user = HashMap.get(userIds, Principal.equal, Principal.hash, caller);
+    switch (user) {
+      case null {
+        let timestamp = Time.now() / 1_000_000_000 : Int; 
+        let userId = generateId();
+        HashMap.put(userIds, Principal.equal, Principal.hash, caller, userId);
+
+        let newUser : User = {
+          name;
+          email;
+          country = null;
+          admissionDate = timestamp;
+          avatar;
+          votedPosts : [Nat] = [];
+          postPublicated : [TutoId] = []
+        };
+        HashMap.put(users, Nat.equal, Nat32.fromNat, userId, newUser);
+        return #ok(newUser)
+      };
+      case (?member) {
+        return #err(#IsAlreadyAMember)
+      }
+    }
+  };
+
+  public shared ({ caller }) func iamRegistered() : async Bool {
+    return switch (HashMap.get(userIds, Principal.equal, Principal.hash, caller)) {
+      case null { false };
+      case _ { true }
+    }
+  };
+
+  public shared ({ caller }) func iamAdmin() : async Bool { isAdmin(caller) };
+
+  public shared ({ caller }) func getMiId() : async ?Nat {
+    assert not Principal.isAnonymous(caller);
+    HashMap.get(userIds, Principal.equal, Principal.hash, caller)
+  };
+
+  public shared ({ caller }) func getMiUser() : async ?User {
+    assert not Principal.isAnonymous(caller);
+    switch (HashMap.get(userIds, Principal.equal, Principal.hash, caller)) {
+      case null { return null };
+      case (?userId) {
+        return HashMap.get(users, Nat.equal, Nat32.fromNat, userId)
+      }
+    }
+  };
+
+  public shared ({ caller }) func userConfig(settings : UserSettings) : async () {
+    switch (getUserByPrincipal(caller)) {
+      case null {};
+      case (?user) {
+        var userId = 0;
+        switch (HashMap.get(userIds, Principal.equal, Principal.hash, caller)) {
+          case null { return };
+          case (?id) { userId := id }
+        };
+        let updateUser = {
+          user with
+          name = switch (settings.name) {
+            case null { user.name };
+            case (?newName) { newName }
+          };
+          avatar = switch (settings.avatar) {
+            case null { user.avatar };
+            case (newAvatar) { newAvatar }
+          };
+          country = switch (settings.country) {
+            case null { user.country };
+            case (newCountry) { newCountry }
+          };
+          email = switch (settings.email) {
+            case null { user.email };
+            case (email) { email }
+          }
+        };
+        HashMap.put<UserId, User>(users, Nat.equal, Nat32.fromNat, userId, updateUser)
+      }
+    }
+  };
+
+  public shared ({ caller }) func loadAvatar(avatar : Blob) : async ?Blob {
+    switch (HashMap.get(userIds, Principal.equal, Principal.hash, caller)) {
+      case null { return null };
+      case (?userId) {
+        switch (HashMap.get(users, Nat.equal, Nat32.fromNat, userId)) {
+          case null { return null };
+          case (?user) {
+            HashMap.put(users, Nat.equal, Nat32.fromNat, userId, { user with avatar = ?avatar });
+            return ?avatar
+          }
+        }
+      }
+    }
+  };
+
+  public shared ({ caller }) func uploadTutorial(content : Tutorial) : async PublishResult {
+    switch (HashMap.get(userIds, Principal.equal, Principal.hash, caller)) {
+      case null { return #err("Caller is not a member") };
+      case (?userId) {
+        let date = Time.now() / 1_000_000_000 : Int;
+        let id = generateId();
+        let pub = {
+          id;
+          autor = userId;
+          date;
+          content;
+          qualifyQty = 0;
+          qualifySum = 0;
+          comments = []
+        };
+        HashMap.put(incomingPublications, tutoIdEqual, tutoIdHash, id, pub);
+        #ok(pub)
+      }
+    }
+  };
+
+  public shared ({ caller }) func addComment(_id : TutoId, content : Text) : async Bool {
+    assert (isUser(caller));
+    switch (HashMap.get(aprovedPublications, tutoIdEqual, tutoIdHash, _id)) {
+      case null { return false };
+      case (?pub) {
+        let commentBuffer = Buffer.fromArray<Comment>(pub.comments);
+        let comment = {
+          id = generateId();
+          autor = caller;
+          content;
+          date = Time.now()
+        };
+        commentBuffer.add(comment);
+        let updatePub = { pub with comments = Buffer.toArray(commentBuffer) };
+        HashMap.put(aprovedPublications, tutoIdEqual, tutoIdHash, _id, updatePub);
+        return true
+      }
+    }
+  };
+
+  public shared ({ caller }) func editComment(_id : TutoId, _commentId : Nat, _updateContent : Text) : async Bool {
+    assert (isUser(caller));
+    let pub = HashMap.get(aprovedPublications, tutoIdEqual, tutoIdHash, _id);
+    switch (pub) {
+      case null { return false };
+      case (?pub) {
+        var index = 0;
+        for (comment in pub.comments.vals()) {
+          if (comment.id == _commentId) {
+            assert (comment.autor == caller);
+            let commentsUpdate = Buffer.fromArray<Comment>(pub.comments);
+            let old = commentsUpdate.remove(index);
+            commentsUpdate.insert(index, { old with content = _updateContent });
+
+            let updatePub = {
+              pub with comments = Buffer.toArray(commentsUpdate)
+            };
+            HashMap.put(aprovedPublications, tutoIdEqual, tutoIdHash, _id, updatePub);
+            return true
+          };
+          index += 1
+        };
+        return false
+      }
+    }
+  };
+
+  public shared ({ caller }) func deleteComment(_id : TutoId, _commentId : Nat) : async Bool {
+    assert (isUser(caller));
+    let pub = HashMap.get(aprovedPublications, tutoIdEqual, tutoIdHash, _id);
+    switch (pub) {
+      case null { return false };
+      case (?pub) {
+        var index = 0;
+        for (comment in pub.comments.vals()) {
+          if (comment.id == _commentId) {
+            assert (comment.autor == caller);
+            let commentsUpdate = Buffer.fromArray<Comment>(pub.comments);
+            ignore commentsUpdate.remove(index);
+            return true
+          };
+          index += 1
+        };
+        return false
+      }
+    }
+  };
+
+  public shared ({ caller }) func qualifyPost(_id : TutoId, q : Nat) : async Bool {
+    assert (q >= 1 and q <= 5);
+    switch (getUserByPrincipal(caller)) {
+      case (?user) {
+        for (postId in user.votedPosts.vals()) {
+          if (postId == _id) {
+            return false
+          }
+        };
+        switch (HashMap.get(aprovedPublications, tutoIdEqual, tutoIdHash, _id)) {
+          case (?pub) {
+            let updatePub = {
+              pub with
+              qualifyQty = pub.qualifyQty + 1;
+              qualifySum = pub.qualifySum + q
+            };
+            HashMap.put(aprovedPublications, tutoIdEqual, tutoIdHash, _id, updatePub);
+            return true
+          };
+          case _ { return false }
+        }
+      };
+      case _ { return false }
+    }
+  };
+
+  public query func isDaoDeployed() : async Bool { _daoIsDeployed() };
+
+  public query func getPrincipalDao() : async Text { Principal.toText(DAO) };
+
+  public shared ({ caller }) func userIsDaoMember() : async Bool {
+    assert (await isDaoDeployed());
+    let daoActor = actor (Principal.toText(DAO)) : actor {
+      getPrincipalMembers : shared () -> async [Principal]
+    };
+    let members : [Principal] = await daoActor.getPrincipalMembers();
+    for (i in members.vals()) {
+      if (i == caller) { return true }
+    };
+    return false
+  };
+
+  public query func getUsers() : async [User] {
+    Iter.toArray<User>(HashMap.vals(users))
+  };
+
+  public query func getAprovedPublication() : async [Publication] {
+    return Iter.toArray(HashMap.vals(aprovedPublications))
+  };
+
+  public query func getPubFromUser(userId : Nat) : async [Publication] {
+    var pubs = Iter.toArray(HashMap.vals(aprovedPublications));
+    Array.filter<Publication>(pubs, func x : Bool { x.autor == userId })
+  };
+
+  public query func getPubByID(id : Nat) : async {
+    pub : Publication;
+    autor : Text
+  } {
+    return switch (HashMap.get(aprovedPublications, tutoIdEqual, tutoIdHash, id)) {
+      case null { { pub = Types.PUBLICATION_NOT_FOUND; autor = "" } };
+      case (?pub) {
+        let autorName = switch (getUserById(pub.autor)) {
+          case null { "Anonymous" };
+          case (?user) { user.name }
+        };
+        { pub; autor = autorName }
+      }
+    }
+  };
+
+  public query func search(target : Text) : async [Publication] {
+    var tokens = Iter.fromArray<Text>([]);
+    let pubs = HashMap.vals(aprovedPublications);
+    let tempBuffer = Buffer.fromArray<Publication>([]);
+    label for0 loop {
+      switch (pubs.next()) {
+        case (?pub) {
+          tokens := Text.split(target, #char(' '));
+          label for1 loop {
+            switch (tokens.next()) {
+              case (?p) {
+                if (Text.contains(pub.content.title, #text(p))) {
+                  tempBuffer.add(pub);
+                  break for1
+                }
+              };
+              case (null) break for1
+            }
+          }
+        };
+        case null { break for0 }
+      }
+    };
+    Buffer.toArray<Publication>(tempBuffer)
+  };
+
+}
